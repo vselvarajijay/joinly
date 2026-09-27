@@ -1,7 +1,10 @@
 import asyncio
 import contextlib
 import logging
+import os
 import re
+import time
+from pathlib import Path
 from typing import Any, ClassVar
 
 from playwright.async_api import Page
@@ -9,9 +12,37 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from joinly.providers.browser.platforms.base import BaseBrowserPlatformController
 from joinly.settings import get_settings
-from joinly.types import MeetingChatHistory, MeetingChatMessage, MeetingParticipant
+from joinly.types import (
+    JoinBlockedError,
+    LobbyTimeoutError,
+    MeetingChatHistory,
+    MeetingChatMessage,
+    MeetingJoinError,
+    MeetingParticipant,
+)
 
 logger = logging.getLogger(__name__)
+
+_LOBBY_RE = re.compile(
+    r"please wait|let you in|you.re waiting|"
+    r"someone in the meeting|waiting for (?:the )?(?:organizer|host|others)",
+    re.IGNORECASE,
+)
+_DENIED_RE = re.compile(
+    r"denied access|you.ve been removed|removed you from|"
+    r"request to join (?:wasn.t|was not) (?:answered|accepted)|"
+    r"no one (?:responded|let you in|admitted you)|"
+    r"(?:can.t|cannot) join this meeting|"
+    r"(?:doesn.t|does not) allow (?:anonymous|guests|people outside)|"
+    r"anonymous (?:users|join|participants) (?:can.t|cannot|isn.t|is not|are not)|"
+    r"meeting has ended|meeting is over",
+    re.IGNORECASE,
+)
+_JOIN_ON_WEB_RE = re.compile(
+    r"continue on this browser|join on the web|join from (?:your|this) browser|"
+    r"use the web app",
+    re.IGNORECASE,
+)
 
 
 class TeamsBrowserPlatformController(BaseBrowserPlatformController):
@@ -45,15 +76,17 @@ class TeamsBrowserPlatformController(BaseBrowserPlatformController):
             name: The name of the participant.
             passcode: The passcode for the meeting (if required).
         """
-        # Check if this is a gov.teams URL
-        if "teams.microsoft.us" in url or "dod.teams.microsoft.us" in url:
-            await self._join_gov_teams(page, url, name)
-        else:
-            await self._join_standard_teams(page, url, name)
+        try:
+            # Check if this is a gov.teams URL
+            if "teams.microsoft.us" in url or "dod.teams.microsoft.us" in url:
+                await self._join_gov_teams(page, url, name)
+            else:
+                await self._join_standard_teams(page, url, name)
 
-        if not await self._check_joined(page):
-            msg = "Join check failed: Failed to join the Teams meeting."
-            raise RuntimeError(msg)
+            await self._wait_for_admission(page, name, get_settings().lobby_timeout)
+        except MeetingJoinError:
+            await self._report_page_state(page)
+            raise
 
         await self._setup_active_speaker_observer(page)
 
@@ -75,20 +108,35 @@ class TeamsBrowserPlatformController(BaseBrowserPlatformController):
         async def _dismiss_dialog(page: Page) -> None:
             await page.click('div[role="dialog"] button', timeout=0)
 
+        async def _click_join_on_web(page: Page) -> None:
+            btn = page.get_by_role("button", name=_JOIN_ON_WEB_RE).or_(
+                page.locator('[data-tid="joinOnWeb"]')
+            )
+            with contextlib.suppress(PlaywrightTimeoutError):
+                await btn.first.click(timeout=20000)
+                logger.info("Teams: chose to continue in the browser")
+
         dismiss_dialog = asyncio.create_task(_dismiss_dialog(page))
+        join_on_web = asyncio.create_task(_click_join_on_web(page))
 
         try:
             name_field = page.get_by_placeholder(re.compile("name", re.IGNORECASE))
-            await name_field.fill(name, timeout=20000)
+            try:
+                await name_field.fill(name, timeout=20000)
+            except PlaywrightTimeoutError:
+                await self._raise_if_denied(page, name)
+                msg = (
+                    "Teams pre-join screen did not show a name field within 20s "
+                    "(guest join may require sign-in for this meeting)."
+                )
+                raise MeetingJoinError(msg) from None
 
-            join_btn = page.get_by_role(
-                "button", name=re.compile(r"join", re.IGNORECASE)
-            )
-            await join_btn.click(timeout=10000)
+            await self._click_join(page, name)
 
         finally:
-            if not dismiss_dialog.done():
-                dismiss_dialog.cancel()
+            for task in (dismiss_dialog, join_on_web):
+                if not task.done():
+                    task.cancel()
 
     async def _join_gov_teams(
         self,
@@ -315,42 +363,206 @@ class TeamsBrowserPlatformController(BaseBrowserPlatformController):
         await share_btn.first.click(timeout=2000)
         await page.wait_for_timeout(500)
 
-    async def _check_joined(self, page: Page, timeout: float = 20) -> bool:  # noqa: ASYNC109
-        """Check if the Teams meeting has been joined successfully.
+    async def _set_prejoin_devices(self, page: Page) -> None:
+        """Set up devices in the pre-join screen: microphone on, camera off.
 
-        Looks for lobby indicators (various "waiting" messages across
-        Teams v1 and v2) or the *Leave* button which confirms the
-        participant is inside the meeting.
+        The microphone is the bot's virtual microphone. The camera is turned off
+        because the Teams v2 web client hangs on "Connecting" when the call
+        starts with joinly's synthetic avatar camera stream (observed 2026-09).
+        Missing switches are logged and Teams' defaults are kept.
+        """
+        wanted = {
+            "microphone": ("toggle-mute", True),
+            "camera": ("toggle-video", False),
+        }
+        for device, (tid, on) in wanted.items():
+            switch = page.locator(f'[data-tid="{tid}"]').first
+            try:
+                await switch.wait_for(state="attached", timeout=15000)
+                if await switch.is_checked() != on:
+                    await switch.set_checked(on, timeout=3000, force=True)
+                logger.info(
+                    "Teams pre-join: %s %s",
+                    device,
+                    "on" if await switch.is_checked() else "off",
+                )
+            except PlaywrightTimeoutError:
+                logger.warning(
+                    "Teams pre-join: %s switch not found; using Teams default", device
+                )
+
+    async def _click_join(self, page: Page, name: str, attempts: int = 3) -> None:
+        """Prepare the pre-join screen and click "Join now" until Teams reacts.
+
+        The Teams v2 web client re-renders the pre-join screen (with an empty
+        name field) while it boots, and ignores clicks that arrive too early
+        (observed 2026-09). So before every click the name and devices are
+        re-applied and the button must be enabled; afterwards it must become
+        disabled (joining) or disappear.
+        """
+        join_btn = (
+            page.locator('[data-tid="prejoin-join-button"]')
+            .or_(page.get_by_role("button", name=re.compile(r"^join", re.IGNORECASE)))
+            .first
+        )
+        name_field = page.get_by_placeholder(re.compile("name", re.IGNORECASE)).first
+        for attempt in range(1, attempts + 1):
+            await join_btn.wait_for(state="visible", timeout=30000)
+            with contextlib.suppress(PlaywrightTimeoutError):
+                if (
+                    await name_field.is_visible()
+                    and await name_field.input_value(timeout=1000) != name
+                ):
+                    await name_field.fill(name, timeout=5000)
+                    logger.info("Teams: (re)entered the name '%s'", name)
+            await self._set_prejoin_devices(page)
+            for _ in range(30):
+                if await join_btn.is_enabled():
+                    break
+                await asyncio.sleep(0.5)
+            with contextlib.suppress(PlaywrightTimeoutError):
+                await join_btn.click(timeout=5000)
+                for _ in range(10):
+                    await asyncio.sleep(0.5)
+                    if (
+                        not await join_btn.is_visible()
+                        or not await join_btn.is_enabled()
+                    ):
+                        logger.info("Teams: join clicked (attempt %d)", attempt)
+                        return
+            logger.warning(
+                "Teams ignored the join click (attempt %d); retrying", attempt
+            )
+            await asyncio.sleep(2)
+        msg = f"Teams did not react to the join button after {attempts} clicks."
+        raise MeetingJoinError(msg)
+
+    async def _report_page_state(self, page: Page) -> None:
+        """Log what the page shows after a failed join (for diagnosing UI changes).
+
+        Logs the URL and visible text. If `JOINLY_DEBUG_DIR` is set, also saves
+        a screenshot and the page HTML there.
+        """
+        with contextlib.suppress(Exception):
+            text = " ".join((await page.inner_text("body", timeout=2000)).split())
+            frames = [f.url for f in page.frames if f != page.main_frame]
+            logger.warning(
+                "Teams page at failure: url=%s frames=%s text=%r",
+                page.url,
+                frames,
+                text[:600],
+            )
+        debug_dir = os.environ.get("JOINLY_DEBUG_DIR")
+        if debug_dir:
+            with contextlib.suppress(Exception):
+                path = Path(debug_dir)
+                path.mkdir(parents=True, exist_ok=True)
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                await page.screenshot(path=path / f"teams-join-{stamp}.png")
+                (path / f"teams-join-{stamp}.html").write_text(await page.content())
+                logger.warning("Saved join debug files to %s", path)
+
+    async def _raise_if_denied(self, page: Page, name: str) -> None:
+        """Raise `JoinBlockedError` if Teams shows a refusal message."""
+        denied = page.get_by_text(_DENIED_RE).filter(visible=True).first
+        with contextlib.suppress(PlaywrightTimeoutError):
+            if await denied.is_visible(timeout=500):
+                text = " ".join((await denied.inner_text(timeout=1000)).split())
+                msg = f"Teams refused to let '{name}' join: {text!r}"
+                raise JoinBlockedError(msg)
+
+    async def _wait_for_admission(  # noqa: C901
+        self,
+        page: Page,
+        name: str,
+        lobby_timeout: float,
+        detect_timeout: float = 30,
+    ) -> None:
+        """Wait until the meeting is joined, handling the lobby.
 
         Args:
             page: The Playwright page instance.
-            timeout: The timeout in seconds for checking the join status.
+            name: The participant name (for log messages).
+            lobby_timeout: Maximum time to wait in the lobby, in seconds.
+            detect_timeout: Maximum time to recognize either the meeting or the
+                lobby after clicking join, in seconds.
 
-        Returns:
-            bool: True if joined, False otherwise.
+        Raises:
+            JoinBlockedError: If Teams denies or blocks the join.
+            LobbyTimeoutError: If nobody admits the participant in time.
+            MeetingJoinError: If neither meeting nor lobby is recognized.
         """
-        locators = [
-            page.locator("span >> text=/please wait/i"),
-            page.locator("span >> text=/will let you in/i"),
-            page.locator("span >> text=/waiting/i"),
-            page.locator("span >> text=/someone in the meeting/i"),
-            page.get_by_role("button", name=re.compile(r"leave", re.IGNORECASE)),
-        ]
+        leave_btn = page.get_by_role(
+            "button", name=re.compile(r"leave", re.IGNORECASE)
+        ).filter(visible=True)
+        lobby = page.get_by_text(_LOBBY_RE).filter(visible=True).first
+        prejoin_btn = page.locator('[data-tid="prejoin-join-button"]').filter(
+            visible=True
+        )
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        in_lobby_since: float | None = None
+        rejoins = 0
 
-        tasks = [
-            asyncio.create_task(loc.wait_for(state="visible", timeout=0))
-            for loc in locators
-        ]
-
-        try:
-            done, _ = await asyncio.wait(
-                tasks, return_when=asyncio.FIRST_COMPLETED, timeout=timeout
-            )
-            return any(not task.exception() for task in done)
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
+        while True:
+            now = loop.time()
+            if (
+                now - start > 5  # noqa: PLR2004
+                and await prejoin_btn.count()
+                and await prejoin_btn.first.is_enabled()
+            ):
+                # Teams dropped back to the pre-join screen (e.g. the join
+                # attempt failed, or the call dropped right after admission)
+                if rejoins >= 3:  # noqa: PLR2004
+                    msg = "Teams kept returning to the pre-join screen after join."
+                    raise MeetingJoinError(msg)
+                rejoins += 1
+                logger.warning(
+                    "Teams returned to the pre-join screen; joining again (%d/3)",
+                    rejoins,
+                )
+                await self._click_join(page, name)
+                start = loop.time()
+                in_lobby_since = None
+                continue
+            if await leave_btn.first.is_visible():
+                if in_lobby_since is not None:
+                    logger.info(
+                        "Admitted from the Teams lobby after %.0fs",
+                        now - in_lobby_since,
+                    )
+                logger.info("Joined the Teams meeting as '%s'", name)
+                return
+            await self._raise_if_denied(page, name)
+            if await lobby.is_visible():
+                if in_lobby_since is None:
+                    in_lobby_since = now
+                    logger.info(
+                        "Waiting in the Teams lobby for up to %.0fs to be admitted",
+                        lobby_timeout,
+                    )
+                elif now - in_lobby_since > lobby_timeout:
+                    msg = (
+                        f"Nobody admitted '{name}' from the Teams lobby within "
+                        f"{lobby_timeout:.0f}s."
+                    )
+                    raise LobbyTimeoutError(msg)
+            elif in_lobby_since is None and now - start > detect_timeout:
+                if await page.get_by_text("Connecting").first.is_visible():
+                    msg = (
+                        f"Teams stayed on 'Connecting' for {detect_timeout:.0f}s after "
+                        "clicking join (media devices may have failed to start)."
+                    )
+                    raise MeetingJoinError(msg)
+                msg = (
+                    "Could not detect the Teams meeting or lobby "
+                    f"{detect_timeout:.0f}s after clicking join."
+                )
+                raise MeetingJoinError(msg)
+            if now - start > detect_timeout + lobby_timeout:
+                msg = f"Timed out joining the Teams meeting as '{name}'."
+                raise LobbyTimeoutError(msg)
+            await asyncio.sleep(0.5)
 
     async def _open_chat(self, page: Page) -> None:
         """Open the chat in the Teams meeting."""

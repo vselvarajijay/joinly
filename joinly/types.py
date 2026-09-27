@@ -41,6 +41,18 @@ class ProviderNotSupportedError(Exception):
     """Raised when a provider does not support a requested feature."""
 
 
+class MeetingJoinError(RuntimeError):
+    """Raised when joining a meeting fails for a known, reportable reason."""
+
+
+class LobbyTimeoutError(MeetingJoinError):
+    """Raised when nobody admits the participant from the lobby in time."""
+
+
+class JoinBlockedError(MeetingJoinError):
+    """Raised when the meeting refuses the participant (denied, blocked, ended)."""
+
+
 class IncompatibleAudioFormatError(Exception):
     """Raised when an audio format is incompatible with the expected or given format."""
 

@@ -1,0 +1,8 @@
+joinly
+Copyright (c) 2025 Dominik Brockmann, Johannes Dittrich, Fynn Aurand
+Licensed under the MIT License (see LICENSE).
+
+This fork includes modifications and additions (GPT-Live voice mode, Teams join
+hardening, and the joinly-backend tool server):
+Copyright (c) 2026 Vijay Selvaraj
+Also licensed under the MIT License.

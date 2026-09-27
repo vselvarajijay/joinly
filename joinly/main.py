@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -157,6 +158,26 @@ def _parse_mcp(
     help="Trigger the agent only when the name is mentioned in the transcript. "
     "Only applicable with --client. Note: it is recommended to change the name "
     "to a rather common name that has higher chance being transcribed.",
+)
+@click.option(
+    "--voice-mode",
+    type=click.Choice(["pipeline", "gpt-live"], case_sensitive=False),
+    help="Voice pipeline: 'pipeline' (VAD/STT/LLM/TTS) or 'gpt-live' "
+    "(OpenAI GPT-Live speech-to-speech with Responses delegation). "
+    "gpt-live requires OPENAI_API_KEY and a meeting URL.",
+    default="pipeline",
+    show_default=True,
+    show_envvar=True,
+    envvar="JOINLY_VOICE_MODE",
+)
+@click.option(
+    "--lobby-timeout",
+    type=float,
+    help="Seconds to wait in a meeting lobby before giving up.",
+    default=300.0,
+    show_default=True,
+    show_envvar=True,
+    envvar="JOINLY_LOBBY_TIMEOUT",
 )
 @click.option(
     "-m",
@@ -345,6 +366,17 @@ def cli(  # noqa: PLR0913
         quiet=quiet,
         plain=logging_plain,
     )
+
+    if settings.voice_mode == "gpt-live":
+        if server is True or not meeting_url:
+            msg = (
+                "--voice-mode gpt-live runs as a client and requires a meeting URL "
+                "(server mode is not supported yet)."
+            )
+            raise click.UsageError(msg)
+        from joinly.voice.gpt_live.runner import run as run_gpt_live
+
+        sys.exit(asyncio.run(run_gpt_live(meeting_url, settings)))
 
     if server is True or (server is None and meeting_url is None):
         mcp.run(transport="streamable-http", host=host, port=port, show_banner=False)

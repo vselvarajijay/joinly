@@ -53,6 +53,21 @@ class MeetingSession:
         self._event_bus = EventBus()
 
     @property
+    def meeting_provider(self) -> MeetingProvider:
+        """Return the meeting provider."""
+        return self._meeting_provider
+
+    @property
+    def transcription_controller(self) -> TranscriptionController:
+        """Return the transcription controller."""
+        return self._transcription_controller
+
+    @property
+    def speech_controller(self) -> SpeechController:
+        """Return the speech controller."""
+        return self._speech_controller
+
+    @property
     def transcript(self) -> Transcript:
         """Return the current transcript of the meeting."""
         if self._transcript is None:

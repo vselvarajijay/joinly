@@ -25,6 +25,7 @@ dependencies = [
     "python-dotenv>=1.1.0",
     "semchunk>=3.2.1",
     "webrtcvad-wheels>=2.0.14",
+    "websockets>=15.0.1",
 ]
 
 [project.scripts]
@@ -46,11 +47,13 @@ dev = [
     "pytest-asyncio>=0.26.0",
     "rich>=14.0.0",
     "ruff>=0.11.6",
+    "joinly-backend",
 ]
 
 [tool.uv.sources]
 joinly-client = { workspace = true }
 joinly-common = { workspace = true }
+joinly-backend = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]
@@ -61,6 +64,7 @@ packages = ["joinly"]
 
 [tool.uv.workspace]
 members = [
+    "backend",
     "client",
     "common",
 ]
@@ -117,6 +121,10 @@ convention = "google"
 "examples/**/*.py" = [
     "INP001",
 ]
+"backend/tests/**/*.py" = [
+    "S101",
+    "INP001",
+]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -131,6 +139,7 @@ venv = ".venv"
 typeCheckingMode = "standard"
 include = [
     "joinly",
+    "backend",
     "client",
     "common",
     "tests"
@@ -146,7 +155,7 @@ exclude = [
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
-testpaths = ["tests"]
+testpaths = ["tests", "backend/tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]

@@ -4,7 +4,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Self
+from typing import Any, Self
 
 from PIL import Image, ImageOps
 from playwright.async_api import Page
@@ -29,6 +29,7 @@ from joinly.types import (
     ActionAnimation,
     AudioChunk,
     MeetingChatHistory,
+    MeetingJoinError,
     MeetingParticipant,
     ProviderNotSupportedError,
     UIAnimationContent,
@@ -75,10 +76,13 @@ class BrowserMeetingProvider(BaseMeetingProvider, VideoReader):
         *,
         reader_byte_depth: int | None = None,
         writer_byte_depth: int | None = None,
+        reader_sample_rate: int | None = None,
+        writer_sample_rate: int | None = None,
         display_size: tuple[int, int] = (1280, 720),
         snapshot_size: tuple[int, int] = (512, 288),
         vnc_server: bool = False,
         vnc_server_port: int = 5900,
+        camera: bool = True,
     ) -> None:
         """Initialize the browser meeting provider.
 
@@ -87,14 +91,21 @@ class BrowserMeetingProvider(BaseMeetingProvider, VideoReader):
                 (default is None).
             writer_byte_depth (int | None): The byte depth for the virtual
                 microphone (default is None).
+            reader_sample_rate (int | None): The sample rate for the virtual
+                speaker (default is None, the device default).
+            writer_sample_rate (int | None): The sample rate for the virtual
+                microphone (default is None, the device default).
             display_size (tuple[int, int]): The virtual display and screen share
                 resolution (default is (1280, 720)).
             snapshot_size (tuple[int, int]): The size of the video snapshot
                 (default is (512, 288)).
             vnc_server (bool): Whether to start a VNC server for the virtual display.
             vnc_server_port (int): The port to use for the VNC server.
+            camera (bool): Whether to provide the virtual avatar camera. When
+                False, the meeting sees an audio-only participant.
         """
         self.snapshot_size = snapshot_size
+        self._camera = camera
         self._display_size = display_size
         self._env = os.environ.copy()
         self._pulse_server = PulseServer(env=self._env)
@@ -104,16 +115,19 @@ class BrowserMeetingProvider(BaseMeetingProvider, VideoReader):
             use_vnc_server=vnc_server,
             vnc_port=vnc_server_port,
         )
-        self._virtual_speaker = (
-            VirtualSpeaker(env=self._env)
-            if not reader_byte_depth
-            else VirtualSpeaker(env=self._env, byte_depth=reader_byte_depth)
-        )
-        self._virtual_microphone = (
-            VirtualMicrophone(env=self._env)
-            if not writer_byte_depth
-            else VirtualMicrophone(env=self._env, byte_depth=writer_byte_depth)
-        )
+        speaker_args: dict[str, Any] = {}
+        if reader_byte_depth:
+            speaker_args["byte_depth"] = reader_byte_depth
+        if reader_sample_rate:
+            speaker_args["sample_rate"] = reader_sample_rate
+            speaker_args["frames_per_chunk"] = reader_sample_rate // 50  # 20 ms
+        microphone_args: dict[str, Any] = {}
+        if writer_byte_depth:
+            microphone_args["byte_depth"] = writer_byte_depth
+        if writer_sample_rate:
+            microphone_args["sample_rate"] = writer_sample_rate
+        self._virtual_speaker = VirtualSpeaker(env=self._env, **speaker_args)
+        self._virtual_microphone = VirtualMicrophone(env=self._env, **microphone_args)
         self._browser_session = BrowserSession(env=self._env)
         self._services = [
             self._pulse_server,
@@ -199,6 +213,9 @@ class BrowserMeetingProvider(BaseMeetingProvider, VideoReader):
         async with self._lock:
             try:
                 yield self._page, self._platform_controller
+            except MeetingJoinError:
+                # known join failure with a clear message; reported by the caller
+                raise
             except Exception as e:
                 msg = f"Failed to perform '{action}'."
                 logger.exception(msg)
@@ -268,7 +285,8 @@ class BrowserMeetingProvider(BaseMeetingProvider, VideoReader):
             raise RuntimeError(msg)
 
         self._page = await self._browser_session.get_page()
-        await self._camera_feed.install(self._page)
+        if self._camera:
+            await self._camera_feed.install(self._page)
         try:
             self._platform_controller = await self._get_platform_controller(url)
         except RuntimeError:

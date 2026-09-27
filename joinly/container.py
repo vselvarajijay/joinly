@@ -65,6 +65,8 @@ class SessionContainer:
 
     async def __aenter__(self) -> MeetingSession:
         """Enter the context manager and create a meeting session."""
+        if self._settings.voice_mode == "gpt-live":
+            return await self._build_gpt_live()
         try:
             vad = await self._build(
                 self._settings.vad,
@@ -158,6 +160,69 @@ class SessionContainer:
             raise
 
         return meeting_session
+
+    async def _build_gpt_live(self) -> MeetingSession:
+        """Create a meeting session for GPT-Live voice mode.
+
+        GPT-Live handles VAD, STT and TTS itself, so no local models are loaded.
+        Meeting audio is captured as 48 kHz PCM16 (Chromium's native rate) and
+        the virtual microphone plays PCM16 at the GPT-Live session rate.
+        """
+        from joinly.voice.gpt_live.config import GptLiveConfig
+        from joinly.voice.gpt_live.controllers import (
+            GptLiveSpeechController,
+            GptLiveTranscriptionController,
+        )
+
+        try:
+            provider_extra_args = (
+                {
+                    "reader_byte_depth": 2,
+                    "writer_byte_depth": 2,
+                    "reader_sample_rate": 48000,
+                    "writer_sample_rate": GptLiveConfig().gpt_live_sample_rate,
+                    # audio-only: the avatar camera stream hangs Teams v2 joins
+                    "camera": False,
+                }
+                if _resolve(
+                    self._settings.meeting_provider,
+                    base="joinly.providers",
+                    suffix="MeetingProvider",
+                ).__name__
+                == "BrowserMeetingProvider"
+                else {}
+            )
+            meeting_provider = await self._build(
+                self._settings.meeting_provider,
+                "joinly.providers",
+                "MeetingProvider",
+                provider_extra_args | self._settings.meeting_provider_args,
+            )
+            transcription_controller = await self._build(
+                GptLiveTranscriptionController,
+                "joinly.controllers.transcription",
+                "TranscriptionController",
+                {},
+            )
+            speech_controller = await self._build(
+                GptLiveSpeechController,
+                "joinly.controllers.speech",
+                "SpeechController",
+                {},
+            )
+            transcription_controller.reader = meeting_provider.audio_reader
+            speech_controller.writer = meeting_provider.audio_writer
+            speech_controller.no_speech_event = transcription_controller.no_speech_event
+
+            return MeetingSession(
+                meeting_provider=meeting_provider,
+                transcription_controller=transcription_controller,
+                speech_controller=speech_controller,
+                video_reader=meeting_provider.video_reader,
+            )
+        except:
+            await self._stack.aclose()
+            raise
 
     async def __aexit__(self, *_exc: object) -> None:
         """Exit the context and clean up resources."""

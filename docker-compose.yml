@@ -1,0 +1,27 @@
+# GPT-Live mode: joinly (meeting bot) + joinly-backend (tool server).
+#
+#   MEETING_URL="https://teams.microsoft.com/l/meetup-join/..." docker compose up --build
+#
+# Neither service publishes ports: the backend is reachable only from joinly on
+# the compose network, and joinly runs as a client (no MCP server is started).
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+
+  joinly:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.lite
+    env_file: .env
+    environment:
+      JOINLY_VOICE_MODE: gpt-live
+      JOINLY_TOOLS_URL: http://backend:8080
+    command: ["--voice-mode", "gpt-live", "-v", "${MEETING_URL:?set MEETING_URL}"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: "no"

@@ -186,6 +186,134 @@ In general, the docker image provides an MCP server which is started by default.
 --stt-arg model_name=<ModelName>  # optionally, set different model
 ```
 
+## GPT-Live mode
+
+`--voice-mode gpt-live` replaces the local VAD → STT → LLM → TTS pipeline with
+OpenAI's full-duplex speech-to-speech model **`gpt-live-1`**. Reasoning and tool
+use are delegated to a backend model (**`gpt-5.6-terra`** by default) via
+GPT-Live's *Responses delegation*. The agent is built for group meetings: it
+stays quiet until someone addresses it by name. It was developed against
+Microsoft Teams, and the Google Meet and Zoom joins are unchanged.
+
+```
+meeting audio (48 kHz) ─▶ resample 24 kHz ─▶ GPT-Live ──delegates──▶ gpt-5.6-terra
+                                                │                        │ function calls
+bot microphone ◀── playback gate ◀── audio ◀────┘          joinly ◀──────┘
+                   (addressed?)                         ├─ meeting tools (in-process)
+                                                        └─ business tools → joinly-backend (FastAPI)
+```
+
+### Setup
+
+1. Copy the GPT-Live block from [.env.example](.env.example) into `.env` and set
+   `OPENAI_API_KEY`. That is the only external service needed.
+2. Build and run. The agent uses the built-in meeting tools:
+
+   ```bash
+   docker build -f docker/Dockerfile.lite -t joinly-helios .
+   docker run --env-file .env joinly-helios --voice-mode gpt-live "<TeamsMeetingURL>"
+   ```
+
+3. *Optional:* **with the tool server** ([backend/](backend/README.md)) for your
+   own business tools, set `JOINLY_BACKEND_TOKEN` in `.env`, then run:
+
+   ```bash
+   MEETING_URL="<TeamsMeetingURL>" docker compose up --build
+   ```
+
+   Neither container publishes a port. joinly runs as a client (no MCP server is
+   started), and the backend is reachable only from joinly on the compose
+   network.
+
+Locally without Docker (Linux with PulseAudio/Xvfb):
+`uv run joinly --env-file .env --voice-mode gpt-live "<TeamsMeetingURL>"`.
+
+### Behaviour
+
+- **Disclosure.** On join, the agent posts in chat *"Hi, I'm Helios, an AI
+  assistant. I'm listening to and transcribing this meeting…"* and says a
+  spoken version once.
+- **Addressing.** The agent is audible only when addressed:
+  - by saying its name (`JOINLY_NAME`, plus the ASR variants in
+    `JOINLY_GPT_LIVE_NAME_ALIASES`);
+  - by typing `@helios` in the meeting chat;
+  - for `JOINLY_GPT_LIVE_FOLLOWUP_SECONDS` afterwards, and while a backend task
+    it was asked for is running.
+
+  See [Limitations](#known-limitations) for how this is enforced.
+- **Barge-in.** When someone talks over the agent for `JOINLY_GPT_LIVE_BARGEIN_MS`
+  (default 800 ms, ignoring the first 0.5 s of each reply), queued agent audio is dropped immediately.
+- **Meeting tools** available to the backend model: `get_transcript`
+  (`latest` + minutes for "summarize the last 5 minutes"), `get_chat_history`,
+  `send_chat_message`, `get_participants` and `get_video_snapshot`. The
+  transcript comes from GPT-Live's own transcription, attributed to Teams'
+  active speaker.
+- **Business tools.** Add them to the FastAPI tool server as typed async
+  functions (see [backend/README.md](backend/README.md)). They are fetched from
+  `GET /tools` at start-up.
+- **Leaving.** The agent leaves on Ctrl-C/SIGTERM, or after being alone in the
+  meeting for 5 minutes.
+- **Exit codes:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | Left normally |
+  | 2 | Configuration error (e.g. no `OPENAI_API_KEY`) |
+  | 3 | Nobody admitted the bot from the lobby within `JOINLY_LOBBY_TIMEOUT` |
+  | 4 | Join refused (denied, anonymous join disabled, meeting ended) |
+  | 5 | Join failed for another reason (no name field, page not recognized) |
+
+### Flags and settings
+
+| Flag / env | Default | |
+|---|---|---|
+| `--voice-mode` / `JOINLY_VOICE_MODE` | `pipeline` | `gpt-live` enables this mode (client mode only) |
+| `--name` / `JOINLY_NAME` | `joinly` | Agent name and meeting display name |
+| `--lang` / `JOINLY_LANGUAGE` | `en` | Spoken language |
+| `--lobby-timeout` / `JOINLY_LOBBY_TIMEOUT` | `300` | Seconds to wait in the lobby |
+| `JOINLY_GPT_LIVE_MODEL`, `JOINLY_GPT_LIVE_VOICE` | `gpt-live-1`, `marin` | Voice model and voice |
+| `JOINLY_BACKEND_MODEL` | `gpt-5.6-terra` | Delegated model |
+| `JOINLY_BACKEND_REASONING_EFFORT` | `low` | Lower means faster answers |
+| `JOINLY_BACKEND_SERVICE_TIER` | `auto` | `priority` = Fast mode, if available |
+| `JOINLY_BACKEND_WEB_SEARCH` | `false` | Adds the hosted `web_search` tool |
+| `JOINLY_TOOLS_URL`, `JOINLY_BACKEND_TOKEN` | – | Tool server URL and shared secret |
+
+All `JOINLY_GPT_LIVE_*` options are listed in [.env.example](.env.example).
+
+### Known limitations
+
+- **Gating is enforced by joinly, not by GPT-Live.** GPT-Live has no setting to
+  suppress replies, so gating combines two layers:
+  - The prompt tells the model to respond only when addressed and not to use
+    backchannels.
+  - A playback gate holds model audio for up to 1.5 s, in case the name arrives
+    in a transcript just after the model starts talking, and otherwise
+    discards it. The model is then told its reply was not heard.
+
+  As a result, the first answer after a silence can be up to 1.5 s slower, and
+  discarded replies still count as billed session time. Someone mentioning the
+  name in passing ("I asked Helios yesterday") also opens the gate.
+- **No speaker attribution.** GPT-Live hears one mixed audio stream. Speaker
+  names come from Teams' active-speaker indicator and are approximate during
+  overlapping speech.
+- **Barge-in is local.** Barge-in uses webrtcvad, independent of GPT-Live's own
+  interruption handling, so a long "mm-hmm" can cut the agent off.
+- **Backend output is spoken unreviewed.** With Responses delegation, the
+  backend model's text goes straight to speech. Put permission checks in your
+  tools.
+- **Cost.** `gpt-live-1` bills **$0.05 per minute while the session is open**,
+  whether or not the agent speaks, plus backend model tokens.
+- **Teams DOM heuristics are fragile.** Lobby, denied and pre-join detection
+  match Teams UI text and `data-tid` attributes, which Microsoft changes over
+  time. Refusal texts are matched in English only.
+- **Chat triggers are polled.** Chat is polled every 4 s, so an `@helios` chat
+  request can take up to about 4 s to be noticed. Anonymous guests can't be
+  picked from Teams' @-mention list; type `@helios` as plain text.
+- **Other limits:**
+  - Server (MCP) mode is not supported with GPT-Live yet.
+  - `get_video_snapshot` attaches the image as a follow-up input item. Check in
+    a live session that the backend model uses it.
+
 ## Debugging
 ```bash
 # Start browser with a VNC server for debugging;

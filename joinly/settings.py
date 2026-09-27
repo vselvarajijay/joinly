@@ -1,5 +1,5 @@
 from contextvars import ContextVar, Token
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     name: str = Field(default="joinly")
     language: str = Field(default="en")
     device: str = Field(default="cpu")
+    voice_mode: Literal["pipeline", "gpt-live"] = Field(default="pipeline")
+    lobby_timeout: float = Field(default=300.0)
 
     meeting_provider: str | type[MeetingProvider] = Field(default="browser")
     vad: str | type[VAD] = Field(default="silero")
